@@ -13,6 +13,7 @@ const AppCoordinate kDefaultTestCoordinate = AppCoordinate(
   39.904200,
   116.407400,
 );
+const List<String> kPaymentMethods = <String>['微信支付', '支付宝', '银行卡'];
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -123,6 +124,7 @@ class HomePage extends StatelessWidget {
   Widget build(BuildContext context) {
     final currentLocation = controller.currentLocation;
     final activeRide = controller.activeSession;
+    final pendingPaymentRide = controller.latestUnpaidRide;
 
     return ListView(
       padding: const EdgeInsets.all(16),
@@ -143,12 +145,55 @@ class HomePage extends StatelessWidget {
             Text('时间：${controller.nowText}'),
             Text('位置：${currentLocation?.label ?? '不可用'}'),
             Text('当前预估费用：¥${controller.estimatedFee.toStringAsFixed(2)}'),
+            Text('待支付订单：${controller.unpaidRideCount} 笔'),
             if (activeRide != null)
               Text(
                 '骑行时长：${formatDuration(activeRide.durationTo(DateTime.now()))}',
               ),
           ],
         ),
+        if (pendingPaymentRide != null) ...[
+          const SizedBox(height: 12),
+          _InfoCard(
+            title: '待支付结算',
+            children: [
+              Text('订单金额：¥${pendingPaymentRide.feeYuan.toStringAsFixed(2)}'),
+              Text(
+                '骑行区间：${pendingPaymentRide.startTimeText} -> '
+                '${pendingPaymentRide.endTimeText}',
+              ),
+              Text(
+                '骑行时长：${formatDuration(Duration(seconds: pendingPaymentRide.durationSec))}',
+              ),
+              Text('支付状态：${pendingPaymentRide.paymentStatusLabel}'),
+              const SizedBox(height: 8),
+              Wrap(
+                spacing: 12,
+                runSpacing: 12,
+                children: [
+                  FilledButton.icon(
+                    onPressed: () async {
+                      await showRidePaymentDialog(
+                        context,
+                        controller,
+                        pendingPaymentRide,
+                      );
+                    },
+                    icon: const Icon(Icons.payments_outlined),
+                    label: const Text('立即支付'),
+                  ),
+                  FilledButton.tonalIcon(
+                    onPressed: () {
+                      showAppSnackBar(context, '订单已保留，可稍后支付。');
+                    },
+                    icon: const Icon(Icons.schedule),
+                    label: const Text('稍后支付'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ],
         const SizedBox(height: 12),
         Wrap(
           spacing: 12,
@@ -256,6 +301,16 @@ class HomePage extends StatelessWidget {
                   onPressed: () async {
                     final response = await controller.lock();
                     if (context.mounted) {
+                      if (response == 'L,OK' &&
+                          controller.latestUnpaidRide != null) {
+                        showAppSnackBar(context, '关锁成功，请完成支付结算。');
+                        await showRidePaymentDialog(
+                          context,
+                          controller,
+                          controller.latestUnpaidRide!,
+                        );
+                        return;
+                      }
                       showAppSnackBar(
                         context,
                         describeMessage(response) ?? '关锁请求失败。',
@@ -422,6 +477,16 @@ class HistoryPage extends StatelessWidget {
     return ListView(
       padding: const EdgeInsets.all(16),
       children: [
+        _InfoCard(
+          title: '结算情况',
+          children: [
+            Text('待支付订单：${controller.unpaidRideCount} 笔'),
+            Text(
+              '已结算订单：${controller.rides.where((item) => item.isPaid).length} 笔',
+            ),
+          ],
+        ),
+        const SizedBox(height: 12),
         if (controller.rides.isEmpty)
           const _InfoCard(title: '骑行记录', children: [Text('暂无骑行记录。')]),
         for (final ride in controller.rides)
@@ -433,8 +498,9 @@ class HistoryPage extends StatelessWidget {
               subtitle: Text(
                 '${ride.startTimeText} -> ${ride.endTimeText}\n'
                 '时长 ${formatDuration(Duration(seconds: ride.durationSec))} | '
-                '${ride.distanceM.toStringAsFixed(1)} 米',
+                '${ride.distanceM.toStringAsFixed(1)} 米 | ${ride.paymentStatusLabel}',
               ),
+              trailing: Chip(label: Text(ride.paymentStatusLabel)),
               isThreeLine: true,
               onTap: () {
                 showDialog<void>(
@@ -443,6 +509,19 @@ class HistoryPage extends StatelessWidget {
                     title: const Text('骑行详情'),
                     content: SelectableText(ride.detailText),
                     actions: [
+                      if (!ride.isPaid)
+                        FilledButton.tonalIcon(
+                          onPressed: () async {
+                            Navigator.of(context).pop();
+                            await showRidePaymentDialog(
+                              context,
+                              controller,
+                              ride,
+                            );
+                          },
+                          icon: const Icon(Icons.payments_outlined),
+                          label: const Text('立即支付'),
+                        ),
                       TextButton(
                         onPressed: () => Navigator.of(context).pop(),
                         child: const Text('关闭'),
@@ -733,6 +812,17 @@ class BikeController extends ChangeNotifier {
   String get displayStatusMessage =>
       describeMessage(lastStatusMessage) ?? '就绪。';
 
+  int get unpaidRideCount => rides.where((item) => !item.isPaid).length;
+
+  RideRecord? get latestUnpaidRide {
+    for (final ride in rides) {
+      if (!ride.isPaid) {
+        return ride;
+      }
+    }
+    return null;
+  }
+
   double get estimatedFee {
     if (activeSession == null) {
       return 0;
@@ -965,6 +1055,12 @@ class BikeController extends ChangeNotifier {
   }
 
   Future<String?> unlock() async {
+    if (latestUnpaidRide != null) {
+      lastStatusMessage = '存在待支付订单，请先完成支付结算。';
+      notifyListeners();
+      return lastStatusMessage;
+    }
+
     final operationLocation = await _resolveOperationLocation(
       scene: 'unlock',
       preferredLocation: debugOverrides.mockUnlockLocation,
@@ -1073,9 +1169,12 @@ class BikeController extends ChangeNotifier {
           durationSec: duration.inSeconds,
           distanceM: distanceM,
           feeYuan: calculateFee(duration),
+          paymentStatus: 'unpaid',
+          paymentMethod: null,
+          paidAt: null,
         );
-        await _repo.insertRide(record);
-        rides.insert(0, record);
+        final savedRecord = await _repo.insertRide(record);
+        rides.insert(0, savedRecord);
         activeSession = null;
         await _repo.clearActiveSession();
         lockState = 'locked';
@@ -1090,6 +1189,35 @@ class BikeController extends ChangeNotifier {
       _pendingLockTime = null;
       _pendingLockLocation = null;
     }
+  }
+
+  Future<bool> settleRidePayment(
+    RideRecord ride, {
+    required String paymentMethod,
+  }) async {
+    if (ride.id == null) {
+      _pushError('payment', '订单缺少编号，无法完成支付结算。');
+      return false;
+    }
+    if (ride.isPaid) {
+      lastStatusMessage = '该订单已完成支付。';
+      notifyListeners();
+      return true;
+    }
+
+    final updated = ride.copyWith(
+      paymentStatus: 'paid',
+      paymentMethod: paymentMethod,
+      paidAt: DateTime.now(),
+    );
+    await _repo.updateRide(updated);
+    final index = rides.indexWhere((item) => item.id == ride.id);
+    if (index >= 0) {
+      rides[index] = updated;
+    }
+    lastStatusMessage = '订单已完成支付并结算。';
+    notifyListeners();
+    return true;
   }
 
   Future<bool> _ensureActiveSessionForLock() async {
@@ -1448,7 +1576,7 @@ class BikeRepository {
     final path = p.join(databasesPath, 'bike_lock.db');
     final database = await openDatabase(
       path,
-      version: 1,
+      version: 2,
       onCreate: (db, version) async {
         await db.execute('''
           CREATE TABLE circles(
@@ -1480,7 +1608,10 @@ class BikeRepository {
             end_lng REAL NOT NULL,
             duration_sec INTEGER NOT NULL,
             distance_m REAL NOT NULL,
-            fee_yuan REAL NOT NULL
+            fee_yuan REAL NOT NULL,
+            payment_status TEXT NOT NULL,
+            payment_method TEXT,
+            paid_at TEXT
           )
         ''');
         await db.execute('''
@@ -1494,6 +1625,15 @@ class BikeRepository {
             last_lng REAL NOT NULL
           )
         ''');
+      },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          await db.execute(
+            "ALTER TABLE rides ADD COLUMN payment_status TEXT NOT NULL DEFAULT 'paid'",
+          );
+          await db.execute('ALTER TABLE rides ADD COLUMN payment_method TEXT');
+          await db.execute('ALTER TABLE rides ADD COLUMN paid_at TEXT');
+        }
       },
     );
     return BikeRepository._(database);
@@ -1552,8 +1692,18 @@ class BikeRepository {
     return rows.map(RideRecord.fromMap).toList();
   }
 
-  Future<void> insertRide(RideRecord ride) async {
-    await db.insert('rides', ride.toMap());
+  Future<RideRecord> insertRide(RideRecord ride) async {
+    final id = await db.insert('rides', ride.toMap());
+    return ride.copyWith(id: id);
+  }
+
+  Future<void> updateRide(RideRecord ride) async {
+    await db.update(
+      'rides',
+      ride.toMap(),
+      where: 'id = ?',
+      whereArgs: <Object?>[ride.id],
+    );
   }
 
   Future<RideSession?> loadActiveSession() async {
@@ -1802,6 +1952,9 @@ class RideRecord {
     required this.durationSec,
     required this.distanceM,
     required this.feeYuan,
+    required this.paymentStatus,
+    required this.paymentMethod,
+    required this.paidAt,
   });
 
   final int? id;
@@ -1813,11 +1966,23 @@ class RideRecord {
   final int durationSec;
   final double distanceM;
   final double feeYuan;
+  final String paymentStatus;
+  final String? paymentMethod;
+  final DateTime? paidAt;
+
+  bool get isPaid => paymentStatus == 'paid';
+
+  String get paymentStatusLabel => isPaid ? '已支付' : '待支付';
+
+  String get paymentMethodLabel => paymentMethod ?? '未支付';
 
   String get startTimeText =>
       startTime.toLocal().toString().replaceFirst('T', ' ').split('.').first;
   String get endTimeText =>
       endTime.toLocal().toString().replaceFirst('T', ' ').split('.').first;
+  String get paidAtText => paidAt == null
+      ? '未支付'
+      : paidAt!.toLocal().toString().replaceFirst('T', ' ').split('.').first;
 
   String get detailText =>
       '''
@@ -1829,7 +1994,40 @@ class RideRecord {
 骑行时长：${formatDuration(Duration(seconds: durationSec))}
 骑行距离：${distanceM.toStringAsFixed(2)} 米
 费用：¥${feeYuan.toStringAsFixed(2)}
+支付状态：$paymentStatusLabel
+支付方式：$paymentMethodLabel
+支付时间：$paidAtText
 ''';
+
+  RideRecord copyWith({
+    int? id,
+    String? bikeMac,
+    DateTime? startTime,
+    DateTime? endTime,
+    AppCoordinate? startLocation,
+    AppCoordinate? endLocation,
+    int? durationSec,
+    double? distanceM,
+    double? feeYuan,
+    String? paymentStatus,
+    String? paymentMethod,
+    DateTime? paidAt,
+  }) {
+    return RideRecord(
+      id: id ?? this.id,
+      bikeMac: bikeMac ?? this.bikeMac,
+      startTime: startTime ?? this.startTime,
+      endTime: endTime ?? this.endTime,
+      startLocation: startLocation ?? this.startLocation,
+      endLocation: endLocation ?? this.endLocation,
+      durationSec: durationSec ?? this.durationSec,
+      distanceM: distanceM ?? this.distanceM,
+      feeYuan: feeYuan ?? this.feeYuan,
+      paymentStatus: paymentStatus ?? this.paymentStatus,
+      paymentMethod: paymentMethod ?? this.paymentMethod,
+      paidAt: paidAt ?? this.paidAt,
+    );
+  }
 
   Map<String, Object?> toMap() => <String, Object?>{
     'id': id,
@@ -1843,6 +2041,9 @@ class RideRecord {
     'duration_sec': durationSec,
     'distance_m': distanceM,
     'fee_yuan': feeYuan,
+    'payment_status': paymentStatus,
+    'payment_method': paymentMethod,
+    'paid_at': paidAt?.toIso8601String(),
   };
 
   static RideRecord fromMap(Map<String, Object?> map) {
@@ -1862,6 +2063,11 @@ class RideRecord {
       durationSec: map['duration_sec'] as int,
       distanceM: (map['distance_m'] as num).toDouble(),
       feeYuan: (map['fee_yuan'] as num).toDouble(),
+      paymentStatus: map['payment_status'] as String? ?? 'paid',
+      paymentMethod: map['payment_method'] as String?,
+      paidAt: map['paid_at'] == null
+          ? null
+          : DateTime.parse(map['paid_at'] as String),
     );
   }
 }
@@ -1946,6 +2152,8 @@ String describeErrorScene(String scene) {
       return '提示音';
     case 'qr':
       return '二维码';
+    case 'payment':
+      return '支付';
     default:
       return scene;
   }
@@ -2325,6 +2533,91 @@ Future<void> showCoordinateEditor(
     return;
   }
   onSaved(AppCoordinate(lat, lng));
+}
+
+Future<void> showRidePaymentDialog(
+  BuildContext context,
+  BikeController controller,
+  RideRecord ride,
+) async {
+  if (ride.isPaid) {
+    if (context.mounted) {
+      showAppSnackBar(context, '该订单已完成支付。');
+    }
+    return;
+  }
+
+  var selectedMethod = kPaymentMethods.first;
+  final confirmed = await showDialog<bool>(
+    context: context,
+    builder: (dialogContext) {
+      return StatefulBuilder(
+        builder: (context, setState) => AlertDialog(
+          title: const Text('支付并结算'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('订单金额：¥${ride.feeYuan.toStringAsFixed(2)}'),
+                Text(
+                  '骑行时长：${formatDuration(Duration(seconds: ride.durationSec))}',
+                ),
+                Text('骑行距离：${ride.distanceM.toStringAsFixed(2)} 米'),
+                const SizedBox(height: 12),
+                const Text('请选择支付方式：'),
+                const SizedBox(height: 8),
+                DropdownButtonFormField<String>(
+                  initialValue: selectedMethod,
+                  decoration: const InputDecoration(
+                    border: OutlineInputBorder(),
+                    labelText: '支付方式',
+                  ),
+                  items: kPaymentMethods
+                      .map(
+                        (method) => DropdownMenuItem<String>(
+                          value: method,
+                          child: Text(method),
+                        ),
+                      )
+                      .toList(),
+                  onChanged: (value) {
+                    if (value == null) {
+                      return;
+                    }
+                    setState(() => selectedMethod = value);
+                  },
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('取消'),
+            ),
+            FilledButton.icon(
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              icon: const Icon(Icons.payments_outlined),
+              label: const Text('确认支付'),
+            ),
+          ],
+        ),
+      );
+    },
+  );
+
+  if (confirmed != true) {
+    return;
+  }
+
+  final success = await controller.settleRidePayment(
+    ride,
+    paymentMethod: selectedMethod,
+  );
+  if (context.mounted) {
+    showAppSnackBar(context, success ? '支付成功，本次骑行已结算。' : '支付失败，请稍后重试。');
+  }
 }
 
 void showErrorSheet(BuildContext context, BikeController controller) {
